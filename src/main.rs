@@ -210,19 +210,23 @@ fn extract_apk_native_so(archive_path: &Path) -> anyhow::Result<PathBuf> {
 
     let arch_priorities = [
         "lib/arm64-v8a/",
+        "lib/x86_64/",
         "lib/armeabi-v7a/",
         "lib/armeabi/",
-        "lib/x86_64/",
         "lib/",
     ];
 
-    // 1. Direct search in primary archive
+    // Priority 1: Search specifically for ARM64 (arm64-v8a) native libraries
     for arch in &arch_priorities {
         for i in 0..archive.len() {
             let mut zip_file = archive.by_index(i)?;
             let name = zip_file.name().to_string();
             if name.starts_with(arch) && name.ends_with(".so") {
+                let is_64bit = arch.contains("arm64") || arch.contains("x86_64");
                 println!("[+] Found NDK shared library in root archive ({}): {}", arch, name);
+                if !is_64bit {
+                    println!("[!] Warning: Selected library is 32-bit ({}). Maarch64 target architecture is ARM64 (AArch64).", arch);
+                }
                 let file_basename = Path::new(&name).file_name().unwrap_or_default();
                 let out_file_path = out_dir.join(file_basename);
                 let mut buffer = Vec::new();
@@ -234,7 +238,7 @@ fn extract_apk_native_so(archive_path: &Path) -> anyhow::Result<PathBuf> {
         }
     }
 
-    // 2. Recursive search in nested split APKs / APKS / XAPK / APKM files
+    // Priority 2: Recursive search in nested split APKs / APKS / XAPK / APKM files
     let mut nested_apk_names = Vec::new();
     for i in 0..archive.len() {
         let zip_file = archive.by_index(i)?;
@@ -256,7 +260,11 @@ fn extract_apk_native_so(archive_path: &Path) -> anyhow::Result<PathBuf> {
                     let mut zip_file = nested_archive.by_index(i)?;
                     let name = zip_file.name().to_string();
                     if name.starts_with(arch) && name.ends_with(".so") {
+                        let is_64bit = arch.contains("arm64") || arch.contains("x86_64");
                         println!("[+] Found NDK shared library in split APK ({}, {}): {}", nested_name, arch, name);
+                        if !is_64bit {
+                            println!("[!] Warning: Selected library is 32-bit ({}). Maarch64 target architecture is ARM64 (AArch64).", arch);
+                        }
                         let file_basename = Path::new(&name).file_name().unwrap_or_default();
                         let out_file_path = out_dir.join(file_basename);
                         let mut buffer = Vec::new();
