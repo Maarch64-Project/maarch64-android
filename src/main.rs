@@ -213,9 +213,130 @@ fn run_apk_bundle(args: &Args, archive_path: &Path, mem: &mut MemoryManager) -> 
         println!("[JVM]   {}::{}{} -> {:#x}", class, method, sig, fn_ptr);
     }
 
+    // Phase 3: Invoke Android Application lifecycle stubs
+    // Call nCreateNativeInstance() → J style methods to bootstrap native objects
+    println!("\n[Phase 3] Invoking registered native lifecycle methods...");
+    invoke_lifecycle_natives(args, &jni_sos, mem, &mut jvm_state)?;
+
     println!("[+] Android JNI Execution Finished Cleanly");
     Ok(())
 }
+
+/// Phase 3: Invoke registered native methods that look like lifecycle hooks.
+/// We look for methods with signature `()J` (create native instances) and
+/// `(JZZ)V` / `(JII)V` (configuration methods) and call them with stub args.
+fn invoke_lifecycle_natives(
+    args: &Args,
+    jni_sos: &[PathBuf],
+    mem: &mut MemoryManager,
+    jvm_state: &mut jvm::JvmState,
+) -> anyhow::Result<()> {
+    // Collect all (class, method, sig, fn_ptr) entries cloned out
+    let native_entries: Vec<((String, String, String), u64)> = jvm_state
+        .native_methods
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    if jni_sos.is_empty() {
+        return Ok(());
+    }
+
+    // Attempt to build a unified thunk manager covering all loaded libraries
+    // We don't reload them but we need to have a ThunkManager for any call.
+    // Use a fresh empty one — JNI thunks are handled separately via is_jni_thunk_address.
+    let thunk_manager = maarch64_thunks::ThunkManager::new();
+    let mut jit_engine = JitEngine::new();
+
+    // Focus on nCreateNativeInstance() -> J (no args, returns long handle)
+    let mut created_instances: Vec<(String, String, u64)> = Vec::new(); // (class, method, returned_handle)
+
+    for ((class, method, sig), fn_ptr) in &native_entries {
+        if sig == "()J" {
+            println!("[Phase3] Calling {}::{}{} @ {:#x}", class, method, sig, fn_ptr);
+            jvm::ensure_jvm_memory_intact(mem);
+
+            let mut ctx = CpuContext::new();
+            ctx.pc = *fn_ptr;
+            ctx.sp = 0x7fff_f000_0000u64;
+            ctx.target_os = TargetOs::Android;
+
+            // JNI native methods: (JNIEnv* env, jobject thiz, ..args..)
+            ctx.set_x(0, jvm::JNIENV_STRUCT_ADDR); // JNIEnv*
+            ctx.set_x(1, 0x0200_0000u64);           // jobject thiz (stub)
+            ctx.set_x(30, 0);                        // return addr → terminates
+
+            let mut step_count = 0u64;
+            let result = run_cpu_loop(
+                &mut ctx, mem, &thunk_manager, &mut jit_engine,
+                &mut step_count, args.jit, jvm_state,
+            );
+
+            let ret = ctx.get_x(0);
+            match result {
+                Ok(_) => {
+                    println!("[Phase3]   -> returned handle {:#x} (steps: {})", ret, step_count);
+                    if ret != 0 {
+                        created_instances.push((class.clone(), method.clone(), ret));
+                    }
+                }
+                Err(e) => {
+                    println!("[Phase3]   -> error: {:?}", e);
+                }
+            }
+        }
+    }
+
+    // For each created instance, call matching (J)V methods (e.g. delete / lifecycle)
+    for (class, _create_method, handle) in &created_instances {
+        for ((c, method, sig), fn_ptr) in &native_entries {
+            if c == class && (sig == "(J)V" || sig == "(JZZ)V" || sig == "(JII)V") {
+                println!("[Phase3] Calling {}::{}{} with handle {:#x}", class, method, sig, handle);
+                jvm::ensure_jvm_memory_intact(mem);
+
+                let mut ctx = CpuContext::new();
+                ctx.pc = *fn_ptr;
+                ctx.sp = 0x7fff_f000_0000u64;
+                ctx.target_os = TargetOs::Android;
+
+                ctx.set_x(0, jvm::JNIENV_STRUCT_ADDR);
+                ctx.set_x(1, 0x0200_0000u64);
+                ctx.set_x(2, *handle);  // J handle arg
+                // For (JZZ)V, x3/x4 = false
+                ctx.set_x(3, 0);
+                ctx.set_x(4, 0);
+                // For (JII)V, x3=640, x4=480 (default resolution)
+                if sig == "(JII)V" {
+                    ctx.set_x(3, 640);
+                    ctx.set_x(4, 480);
+                }
+                ctx.set_x(30, 0);
+
+                let mut step_count = 0u64;
+                let result = run_cpu_loop(
+                    &mut ctx, mem, &thunk_manager, &mut jit_engine,
+                    &mut step_count, args.jit, jvm_state,
+                );
+
+                match result {
+                    Ok(_) => println!("[Phase3]   -> ok (steps: {})", step_count),
+                    Err(e) => println!("[Phase3]   -> error: {:?}", e),
+                }
+            }
+        }
+    }
+
+    if created_instances.is_empty() && native_entries.is_empty() {
+        println!("[Phase3] No callable native lifecycle methods found.");
+    } else if created_instances.is_empty() {
+        println!("[Phase3] No ()J constructors found to invoke.");
+    } else {
+        println!("[Phase3] Created {} native instances successfully.", created_instances.len());
+    }
+
+    Ok(())
+}
+
 
 /// Invoke `JNI_OnLoad(JavaVM*, void*)` in a loaded .so.
 fn invoke_jni_onload(args: &Args, so_path: &Path, mem: &mut MemoryManager, jvm_state: &mut jvm::JvmState) -> anyhow::Result<()> {
