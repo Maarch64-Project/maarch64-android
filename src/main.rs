@@ -137,6 +137,9 @@ fn main() -> anyhow::Result<()> {
         ctx.set_x(1, win_handle);
         ctx.set_x(30, 0);
         let _ = run_cpu_loop(&mut ctx, &mut mem, &thunk_manager, &mut jit_engine, &mut step_count, args.jit);
+    } else {
+        println!("[i] Note: Target binary does not export ANativeActivity_onCreate (Native UI Window lifecycle callback).");
+        println!("[i] Java/Kotlin Android apps (like LINE) manage UI rendering via Java ART VM & Android View framework, whereas Pure C/C++ NDK apps (NativeActivity / SDL / Raylib) create Native GUI Windows directly.");
     }
 
     println!("[+] Android Native Execution Finished Cleanly (Steps: {})", step_count);
