@@ -54,8 +54,11 @@ fn main() -> anyhow::Result<()> {
     let target_path = &args.target;
     let mut mem = MemoryManager::new();
 
-    let binary_path = if target_path.extension().and_then(|e| e.to_str()) == Some("apk") {
-        println!("[+] Target is APK archive: {:?}", target_path);
+    let ext = target_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_archive = matches!(ext.to_lowercase().as_str(), "apk" | "apkm" | "xapk" | "apks" | "zip");
+
+    let binary_path = if is_archive {
+        println!("[+] Target is Android App Bundle / Archive ({:?}): {:?}", ext, target_path);
         extract_apk_native_so(target_path)?
     } else {
         target_path.clone()
@@ -198,38 +201,74 @@ fn run_cpu_loop(
     Ok(())
 }
 
-fn extract_apk_native_so(apk_path: &Path) -> anyhow::Result<PathBuf> {
-    let file = File::open(apk_path)?;
+fn extract_apk_native_so(archive_path: &Path) -> anyhow::Result<PathBuf> {
+    let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
-
-    let mut so_file_name: Option<String> = None;
-
-    for i in 0..archive.len() {
-        let zip_file = archive.by_index(i)?;
-        let name = zip_file.name();
-        if name.starts_with("lib/arm64-v8a/") && name.ends_with(".so") {
-            println!("[+] Found ARM64 NDK shared library in APK: {}", name);
-            so_file_name = Some(name.to_string());
-            break;
-        }
-    }
-
-    let target_so_name = so_file_name
-        .ok_or_else(|| anyhow::anyhow!("No lib/arm64-v8a/*.so found in APK archive"))?;
 
     let out_dir = std::env::temp_dir().join("maarch64_apk_extracted");
     fs::create_dir_all(&out_dir)?;
 
-    let mut zip_file = archive.by_name(&target_so_name)?;
-    let file_basename = Path::new(&target_so_name)
-        .file_name()
-        .unwrap_or_default();
-    let out_file_path = out_dir.join(file_basename);
+    let arch_priorities = [
+        "lib/arm64-v8a/",
+        "lib/armeabi-v7a/",
+        "lib/armeabi/",
+        "lib/x86_64/",
+        "lib/",
+    ];
 
-    let mut buffer = Vec::new();
-    zip_file.read_to_end(&mut buffer)?;
-    fs::write(&out_file_path, &buffer)?;
+    // 1. Direct search in primary archive
+    for arch in &arch_priorities {
+        for i in 0..archive.len() {
+            let mut zip_file = archive.by_index(i)?;
+            let name = zip_file.name().to_string();
+            if name.starts_with(arch) && name.ends_with(".so") {
+                println!("[+] Found NDK shared library in root archive ({}): {}", arch, name);
+                let file_basename = Path::new(&name).file_name().unwrap_or_default();
+                let out_file_path = out_dir.join(file_basename);
+                let mut buffer = Vec::new();
+                zip_file.read_to_end(&mut buffer)?;
+                fs::write(&out_file_path, &buffer)?;
+                println!("[+] Extracted native library to: {:?}", out_file_path);
+                return Ok(out_file_path);
+            }
+        }
+    }
 
-    println!("[+] Extracted native library to: {:?}", out_file_path);
-    Ok(out_file_path)
+    // 2. Recursive search in nested split APKs / APKS / XAPK / APKM files
+    let mut nested_apk_names = Vec::new();
+    for i in 0..archive.len() {
+        let zip_file = archive.by_index(i)?;
+        let name = zip_file.name().to_string();
+        if name.ends_with(".apk") || name.ends_with(".apks") {
+            nested_apk_names.push(name);
+        }
+    }
+
+    for nested_name in nested_apk_names {
+        println!("[+] Scanning nested split APK inside bundle: {}", nested_name);
+        let mut nested_file = archive.by_name(&nested_name)?;
+        let mut nested_buf = Vec::new();
+        nested_file.read_to_end(&mut nested_buf)?;
+
+        if let Ok(mut nested_archive) = ZipArchive::new(std::io::Cursor::new(nested_buf)) {
+            for arch in &arch_priorities {
+                for i in 0..nested_archive.len() {
+                    let mut zip_file = nested_archive.by_index(i)?;
+                    let name = zip_file.name().to_string();
+                    if name.starts_with(arch) && name.ends_with(".so") {
+                        println!("[+] Found NDK shared library in split APK ({}, {}): {}", nested_name, arch, name);
+                        let file_basename = Path::new(&name).file_name().unwrap_or_default();
+                        let out_file_path = out_dir.join(file_basename);
+                        let mut buffer = Vec::new();
+                        zip_file.read_to_end(&mut buffer)?;
+                        fs::write(&out_file_path, &buffer)?;
+                        println!("[+] Extracted native library to: {:?}", out_file_path);
+                        return Ok(out_file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("No native shared library (*.so) found in archive or nested split APKs")
 }
