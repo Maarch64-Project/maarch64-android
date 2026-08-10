@@ -1,0 +1,15 @@
+[package]
+name = "maarch64-android"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+maarch64-core = { path = "../core" }
+maarch64-thunks = { path = "../thunks" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zip = "2.1"
+anyhow = "1.0"
