@@ -97,11 +97,14 @@ pub fn build_jvm_memory(mem: &mut MemoryManager) -> anyhow::Result<JvmState> {
     use jni_stubs::{jnienv_slot, javavm_slot, jnienv_thunk_addr, javavm_thunk_addr};
 
     // ---- Allocate guest memory pages ----
-    let _ = mem.map_anonymous(JAVAVM_STRUCT_ADDR,   0x200);  // JavaVM struct + fn table
-    let _ = mem.map_anonymous(JNIENV_STRUCT_ADDR,   0x10);   // JNIEnv struct (just the fn-table ptr)
-    let _ = mem.map_anonymous(JNIENV_FUNCTIONS_ADDR, 0x800); // 232 × 8 = 1856 bytes
+    let _ = mem.map_anonymous(JAVAVM_STRUCT_ADDR,   0x1000); // JavaVM struct + fn table (full page)
+    let _ = mem.map_anonymous(JNIENV_STRUCT_ADDR,   0x1000); // JNIEnv struct (full page, covers overreads)
+    let _ = mem.map_anonymous(JNIENV_FUNCTIONS_ADDR, 0x1000); // 232 × 8 = 1856 bytes (rounded to page)
     let _ = mem.map_anonymous(jni_stubs::JNIENV_THUNK_BASE, 0x2000); // thunk stubs
-    let _ = mem.map_anonymous(jni_stubs::JAVAVM_THUNK_BASE, 0x100);
+    let _ = mem.map_anonymous(jni_stubs::JAVAVM_THUNK_BASE, 0x1000); // JavaVM thunks (full page)
+    // Null-pointer guard zone: map but treat accesses as JNI returns 0
+    // (some .so do null checks by reading from 0x28 etc. before branching)
+    let _ = mem.map_anonymous(0x0000_0000, 0x1000);
 
     // ---- JavaVM struct: points to functions table ----
     mem.write(JAVAVM_STRUCT_ADDR, &JAVAVM_FUNCTIONS_ADDR.to_le_bytes())?;
@@ -166,6 +169,74 @@ pub fn build_jvm_memory(mem: &mut MemoryManager) -> anyhow::Result<JvmState> {
     println!("[JVM] JNIEnv stub at {:#x} (fn table at {:#x}, {} slots)", JNIENV_STRUCT_ADDR, JNIENV_FUNCTIONS_ADDR, 232);
 
     Ok(JvmState::new())
+}
+
+/// Re-write the critical JVM memory pointers.
+/// Must be called before each JNI_OnLoad because the ELF loader may remap
+/// pages over JAVAVM/JNIENV regions when loading multiple .so files.
+pub fn ensure_jvm_memory_intact(mem: &mut MemoryManager) {
+    use jni_stubs::{jnienv_slot, javavm_slot, jnienv_thunk_addr, javavm_thunk_addr};
+
+    // Re-map if needed
+    let _ = mem.map_anonymous(JAVAVM_STRUCT_ADDR,   0x1000);
+    let _ = mem.map_anonymous(JNIENV_STRUCT_ADDR,   0x1000);
+    let _ = mem.map_anonymous(JNIENV_FUNCTIONS_ADDR, 0x1000);
+    let _ = mem.map_anonymous(jni_stubs::JNIENV_THUNK_BASE, 0x2000);
+    let _ = mem.map_anonymous(jni_stubs::JAVAVM_THUNK_BASE, 0x1000);
+    let _ = mem.map_anonymous(0x0000_0000, 0x1000);
+
+    // JavaVM struct: *JavaVM = &JavaVM_functions
+    let _ = mem.write(JAVAVM_STRUCT_ADDR, &JAVAVM_FUNCTIONS_ADDR.to_le_bytes());
+
+    // JavaVM functions
+    let wj = |mem: &mut MemoryManager, slot: usize, addr: u64| {
+        let _ = mem.write(JAVAVM_FUNCTIONS_ADDR + (slot as u64) * 8, &addr.to_le_bytes());
+    };
+    wj(mem, javavm_slot::DESTROY_JAVA_VM, javavm_thunk_addr(javavm_slot::DESTROY_JAVA_VM));
+    wj(mem, javavm_slot::ATTACH_CURRENT_THREAD, javavm_thunk_addr(javavm_slot::ATTACH_CURRENT_THREAD));
+    wj(mem, javavm_slot::DETACH_CURRENT_THREAD, javavm_thunk_addr(javavm_slot::DETACH_CURRENT_THREAD));
+    wj(mem, javavm_slot::GET_ENV, javavm_thunk_addr(javavm_slot::GET_ENV));
+    wj(mem, javavm_slot::ATTACH_CURRENT_THREAD_AS_DAEMON, javavm_thunk_addr(javavm_slot::ATTACH_CURRENT_THREAD_AS_DAEMON));
+
+    // JNIEnv struct: *JNIEnv = &JNIEnv_functions
+    let _ = mem.write(JNIENV_STRUCT_ADDR, &JNIENV_FUNCTIONS_ADDR.to_le_bytes());
+
+    // JNIEnv functions (all 232 slots)
+    let we = |mem: &mut MemoryManager, slot: usize, addr: u64| {
+        let _ = mem.write(JNIENV_FUNCTIONS_ADDR + (slot as u64) * 8, &addr.to_le_bytes());
+    };
+    for i in 0..232usize { we(mem, i, jnienv_thunk_addr(i)); }
+    we(mem, jnienv_slot::GET_VERSION,             jnienv_thunk_addr(jnienv_slot::GET_VERSION));
+    we(mem, jnienv_slot::FIND_CLASS,              jnienv_thunk_addr(jnienv_slot::FIND_CLASS));
+    we(mem, jnienv_slot::GET_METHOD_ID,           jnienv_thunk_addr(jnienv_slot::GET_METHOD_ID));
+    we(mem, jnienv_slot::GET_STATIC_METHOD_ID,    jnienv_thunk_addr(jnienv_slot::GET_STATIC_METHOD_ID));
+    we(mem, jnienv_slot::CALL_VOID_METHOD,        jnienv_thunk_addr(jnienv_slot::CALL_VOID_METHOD));
+    we(mem, jnienv_slot::CALL_OBJECT_METHOD,      jnienv_thunk_addr(jnienv_slot::CALL_OBJECT_METHOD));
+    we(mem, jnienv_slot::CALL_INT_METHOD,         jnienv_thunk_addr(jnienv_slot::CALL_INT_METHOD));
+    we(mem, jnienv_slot::CALL_BOOLEAN_METHOD,     jnienv_thunk_addr(jnienv_slot::CALL_BOOLEAN_METHOD));
+    we(mem, jnienv_slot::CALL_LONG_METHOD,        jnienv_thunk_addr(jnienv_slot::CALL_LONG_METHOD));
+    we(mem, jnienv_slot::CALL_STATIC_VOID_METHOD, jnienv_thunk_addr(jnienv_slot::CALL_STATIC_VOID_METHOD));
+    we(mem, jnienv_slot::CALL_STATIC_OBJECT_METHOD, jnienv_thunk_addr(jnienv_slot::CALL_STATIC_OBJECT_METHOD));
+    we(mem, jnienv_slot::NEW_STRING_UTF,          jnienv_thunk_addr(jnienv_slot::NEW_STRING_UTF));
+    we(mem, jnienv_slot::GET_STRING_UTF_CHARS,    jnienv_thunk_addr(jnienv_slot::GET_STRING_UTF_CHARS));
+    we(mem, jnienv_slot::RELEASE_STRING_UTF_CHARS,jnienv_thunk_addr(jnienv_slot::RELEASE_STRING_UTF_CHARS));
+    we(mem, jnienv_slot::EXCEPTION_OCCURRED,      jnienv_thunk_addr(jnienv_slot::EXCEPTION_OCCURRED));
+    we(mem, jnienv_slot::EXCEPTION_DESCRIBE,      jnienv_thunk_addr(jnienv_slot::EXCEPTION_DESCRIBE));
+    we(mem, jnienv_slot::EXCEPTION_CLEAR,         jnienv_thunk_addr(jnienv_slot::EXCEPTION_CLEAR));
+    we(mem, jnienv_slot::NEW_GLOBAL_REF,          jnienv_thunk_addr(jnienv_slot::NEW_GLOBAL_REF));
+    we(mem, jnienv_slot::DELETE_GLOBAL_REF,       jnienv_thunk_addr(jnienv_slot::DELETE_GLOBAL_REF));
+    we(mem, jnienv_slot::DELETE_LOCAL_REF,        jnienv_thunk_addr(jnienv_slot::DELETE_LOCAL_REF));
+    we(mem, jnienv_slot::GET_OBJECT_CLASS,        jnienv_thunk_addr(jnienv_slot::GET_OBJECT_CLASS));
+    we(mem, jnienv_slot::IS_INSTANCE_OF,          jnienv_thunk_addr(jnienv_slot::IS_INSTANCE_OF));
+    we(mem, jnienv_slot::GET_FIELD_ID,            jnienv_thunk_addr(jnienv_slot::GET_FIELD_ID));
+    we(mem, jnienv_slot::GET_STATIC_FIELD_ID,     jnienv_thunk_addr(jnienv_slot::GET_STATIC_FIELD_ID));
+    we(mem, jnienv_slot::GET_OBJECT_FIELD,        jnienv_thunk_addr(jnienv_slot::GET_OBJECT_FIELD));
+    we(mem, jnienv_slot::GET_INT_FIELD,           jnienv_thunk_addr(jnienv_slot::GET_INT_FIELD));
+    we(mem, jnienv_slot::REGISTER_NATIVES,        jnienv_thunk_addr(jnienv_slot::REGISTER_NATIVES));
+    we(mem, jnienv_slot::GET_JAVA_VM,             jnienv_thunk_addr(jnienv_slot::GET_JAVA_VM));
+    we(mem, jnienv_slot::GET_ARRAY_LENGTH,        jnienv_thunk_addr(jnienv_slot::GET_ARRAY_LENGTH));
+    we(mem, jnienv_slot::MONITOR_ENTER,           jnienv_thunk_addr(jnienv_slot::MONITOR_ENTER));
+    we(mem, jnienv_slot::MONITOR_EXIT,            jnienv_thunk_addr(jnienv_slot::MONITOR_EXIT));
 }
 
 /// Handle a JNI thunk call from the CPU loop.

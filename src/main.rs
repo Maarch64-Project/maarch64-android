@@ -175,14 +175,14 @@ fn run_apk_bundle(args: &Args, archive_path: &Path, mem: &mut MemoryManager) -> 
     if so_files.is_empty() {
         anyhow::bail!("No ARM64 native libraries found in archive");
     }
-    println!("[APK] Extracted {} ARM64 native libraries", so_files.len());
+    println!("[APK] Found {} ARM64 native libraries", so_files.len());
 
     // Step 3: Build JavaVM / JNIEnv stubs in guest memory
     let mut jvm_state = jvm::build_jvm_memory(mem)?;
 
     // Step 4: Find .so files that export JNI_OnLoad and invoke them
     let target_so = args.so.as_deref();
-    let jni_sos = find_jni_onload_libs(&so_files, target_so);
+    let mut jni_sos = find_jni_onload_libs(&so_files, target_so);
 
     if jni_sos.is_empty() {
         println!("[JVM] No JNI_OnLoad libraries found. Trying first available .so...");
@@ -192,7 +192,15 @@ fn run_apk_bundle(args: &Args, archive_path: &Path, mem: &mut MemoryManager) -> 
         return Ok(());
     }
 
-    println!("[JVM] Found {} JNI_OnLoad libraries. Invoking...", jni_sos.len());
+    // Phase 2: Dependency ordering — load libc++_shared and runtime libs first
+    let priority_libs = ["libc++_shared.so", "libboost_system.so", "libboost_filesystem.so"];
+    jni_sos.sort_by_key(|p| {
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let prio = priority_libs.iter().position(|l| name == *l).unwrap_or(999);
+        prio
+    });
+
+    println!("[JVM] Found {} JNI_OnLoad libraries. Invoking in dependency order...", jni_sos.len());
 
     for so_path in &jni_sos {
         if let Err(e) = invoke_jni_onload(args, so_path, mem, &mut jvm_state) {
@@ -241,6 +249,10 @@ fn invoke_jni_onload(args: &Args, so_path: &Path, mem: &mut MemoryManager, jvm_s
     ctx.set_x(0, jvm::JAVAVM_STRUCT_ADDR);
     ctx.set_x(1, 0); // reserved = NULL
     ctx.set_x(30, 0); // return to NULL -> terminates
+
+    // Re-write the JVM structures: the ELF loader may have mapped pages over them.
+    // We ensure the fn-table pointers are written before every JNI_OnLoad call.
+    jvm::ensure_jvm_memory_intact(mem);
 
     let mut thunk_manager = maarch64_thunks::ThunkManager::new();
     for (addr, sym_name) in &loaded.dynamic_thunks {
@@ -305,10 +317,12 @@ fn find_jni_onload_libs(so_files: &[PathBuf], filter: Option<&str>) -> Vec<PathB
 }
 
 /// Extract ALL ARM64 .so files from the bundle into `out_dir`.
+/// If files already exist on disk (cached), they are still included in the result.
 fn extract_all_native_sos(archive_path: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
     // Direct search in primary archive
     for i in 0..archive.len() {
@@ -317,10 +331,14 @@ fn extract_all_native_sos(archive_path: &Path, out_dir: &Path) -> anyhow::Result
         if name.starts_with("lib/arm64-v8a/") && name.ends_with(".so") {
             let fname = Path::new(&name).file_name().unwrap_or_default();
             let out_path = out_dir.join(fname);
-            let mut buf = Vec::new();
-            zip_file.read_to_end(&mut buf)?;
-            fs::write(&out_path, &buf)?;
-            result.push(out_path);
+            if seen.insert(out_path.clone()) {
+                if !out_path.exists() {
+                    let mut buf = Vec::new();
+                    zip_file.read_to_end(&mut buf)?;
+                    fs::write(&out_path, &buf)?;
+                }
+                result.push(out_path);
+            }
         }
     }
 
@@ -343,10 +361,12 @@ fn extract_all_native_sos(archive_path: &Path, out_dir: &Path) -> anyhow::Result
                 if name.starts_with("lib/arm64-v8a/") && name.ends_with(".so") {
                     let fname = Path::new(&name).file_name().unwrap_or_default();
                     let out_path = out_dir.join(fname);
-                    if !out_path.exists() {
-                        let mut content = Vec::new();
-                        zip_file.read_to_end(&mut content)?;
-                        fs::write(&out_path, &content)?;
+                    if seen.insert(out_path.clone()) {
+                        if !out_path.exists() {
+                            let mut content = Vec::new();
+                            zip_file.read_to_end(&mut content)?;
+                            fs::write(&out_path, &content)?;
+                        }
                         result.push(out_path);
                     }
                 }
