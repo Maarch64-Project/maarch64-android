@@ -109,6 +109,11 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
+        if ctx.pc == 0 {
+            tracing::info!("[+] Function returned to NULL (PC=0), finishing entry point execution.");
+            break;
+        }
+
         let res = if args.jit {
             jit_engine.execute(&mut ctx, &mut mem)
         } else {
