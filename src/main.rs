@@ -76,6 +76,16 @@ fn main() -> anyhow::Result<()> {
     ctx.sp = loaded.stack_pointer;
     ctx.target_os = TargetOs::Android;
 
+    // Allocate ANativeActivity memory structure
+    let activity_ptr = mem.map_anonymous(0x7f03_0000, 256).unwrap_or(0x7f03_0000);
+    let callbacks_ptr = activity_ptr + 128;
+    let _ = mem.write(activity_ptr, &callbacks_ptr.to_le_bytes());
+
+    // Pass ANativeActivity struct as first argument (x0)
+    ctx.set_x(0, activity_ptr);
+    ctx.set_x(1, 0); // savedState
+    ctx.set_x(2, 0); // savedStateSize
+
     let mut thunk_manager = maarch64_thunks::ThunkManager::new();
     for (addr, name) in &loaded.dynamic_thunks {
         thunk_manager.resolve_dynamic_symbol(name, *addr);
@@ -90,16 +100,72 @@ fn main() -> anyhow::Result<()> {
     let mut jit_engine = JitEngine::new();
     let mut step_count = 0u64;
 
+    // Run ANativeActivity_onCreate or main entry point
+    run_cpu_loop(&mut ctx, &mut mem, &thunk_manager, &mut jit_engine, &mut step_count, args.jit)?;
+
+    // Read callbacks table
+    let on_start_ptr = read_u64(&mem, callbacks_ptr);
+    let on_resume_ptr = read_u64(&mem, callbacks_ptr + 8);
+    let on_window_created_ptr = read_u64(&mem, callbacks_ptr + 56);
+
+    if on_start_ptr != 0 {
+        println!("[+] Invoking ANativeActivity onStart callback ({:#x})...", on_start_ptr);
+        ctx.pc = on_start_ptr;
+        ctx.set_x(0, activity_ptr);
+        ctx.set_x(30, 0);
+        let _ = run_cpu_loop(&mut ctx, &mut mem, &thunk_manager, &mut jit_engine, &mut step_count, args.jit);
+    }
+
+    if on_resume_ptr != 0 {
+        println!("[+] Invoking ANativeActivity onResume callback ({:#x})...", on_resume_ptr);
+        ctx.pc = on_resume_ptr;
+        ctx.set_x(0, activity_ptr);
+        ctx.set_x(30, 0);
+        let _ = run_cpu_loop(&mut ctx, &mut mem, &thunk_manager, &mut jit_engine, &mut step_count, args.jit);
+    }
+
+    if on_window_created_ptr != 0 {
+        println!("[+] Creating Native Window for ANativeActivity onNativeWindowCreated ({:#x})...", on_window_created_ptr);
+        let _ = maarch64_thunks::gpu::thunk_XCreateWindow(&mut ctx, &mut mem);
+        let win_handle = ctx.get_x(0);
+
+        ctx.pc = on_window_created_ptr;
+        ctx.set_x(0, activity_ptr);
+        ctx.set_x(1, win_handle);
+        ctx.set_x(30, 0);
+        let _ = run_cpu_loop(&mut ctx, &mut mem, &thunk_manager, &mut jit_engine, &mut step_count, args.jit);
+    }
+
+    println!("[+] Android Native Execution Finished Cleanly (Steps: {})", step_count);
+    Ok(())
+}
+
+fn read_u64(mem: &MemoryManager, addr: u64) -> u64 {
+    if let Ok(bytes) = mem.read(addr, 8) {
+        u64::from_le_bytes(bytes.try_into().unwrap_or_default())
+    } else {
+        0
+    }
+}
+
+fn run_cpu_loop(
+    ctx: &mut CpuContext,
+    mem: &mut MemoryManager,
+    thunk_manager: &maarch64_thunks::ThunkManager,
+    jit_engine: &mut JitEngine,
+    step_count: &mut u64,
+    use_jit: bool,
+) -> anyhow::Result<()> {
     loop {
-        step_count += 1;
-        if step_count >= 50_000_000 {
+        *step_count += 1;
+        if *step_count >= 50_000_000 {
             eprintln!("[!] Reached max execution step limit.");
             break;
         }
 
         if let Some(thunk) = thunk_manager.get_thunk_by_address(ctx.pc) {
             let entry_pc = ctx.pc;
-            let _ = thunk(&mut ctx, &mut mem);
+            let _ = thunk(ctx, mem);
             if ctx.exited {
                 break;
             }
@@ -110,14 +176,14 @@ fn main() -> anyhow::Result<()> {
         }
 
         if ctx.pc == 0 {
-            tracing::info!("[+] Function returned to NULL (PC=0), finishing entry point execution.");
+            tracing::info!("[+] Function returned to NULL (PC=0), finishing execution.");
             break;
         }
 
-        let res = if args.jit {
-            jit_engine.execute(&mut ctx, &mut mem)
+        let res = if use_jit {
+            jit_engine.execute(ctx, mem)
         } else {
-            Interpreter::step(&mut ctx, &mut mem)
+            Interpreter::step(ctx, mem)
         };
 
         match res {
@@ -129,8 +195,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    println!("[+] Android Native Execution Finished Cleanly (Steps: {})", step_count);
     Ok(())
 }
 
