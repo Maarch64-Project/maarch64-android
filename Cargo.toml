@@ -13,3 +13,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zip = "2.1"
 anyhow = "1.0"
+dex = "0.5"
+object = { workspace = true }
