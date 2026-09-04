@@ -13,6 +13,44 @@ pub struct ManifestInfo {
     pub package_name: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct DexInfo {
+    pub class_count: usize,
+    pub classes: Vec<String>,
+    pub activities: Vec<String>,
+    pub services: Vec<String>,
+}
+
+/// Parse a `classes.dex` file and extract class definitions.
+pub fn parse_dex(data: &[u8]) -> anyhow::Result<DexInfo> {
+    let dex_file = dex::DexReader::from_vec(data.to_vec())
+        .map_err(|e| anyhow::anyhow!("DEX parse error: {:?}", e))?;
+
+    let mut classes: Vec<String> = Vec::new();
+    let mut activities: Vec<String> = Vec::new();
+    let mut services: Vec<String> = Vec::new();
+
+    for class in dex_file.classes() {
+        if let Ok(c) = class {
+            let jtype = c.jtype().to_string();
+            classes.push(jtype.clone());
+            if jtype.ends_with("Activity;") || jtype.contains("activity") {
+                activities.push(jtype.clone());
+            } else if jtype.ends_with("Service;") || jtype.contains("service") {
+                services.push(jtype.clone());
+            }
+        }
+    }
+
+    let count = classes.len();
+    Ok(DexInfo {
+        class_count: count,
+        classes,
+        activities,
+        services,
+    })
+}
+
 impl ManifestInfo {
     /// Parse binary `AndroidManifest.xml` and extract key attributes.
     pub fn parse(data: &[u8]) -> Self {

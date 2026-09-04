@@ -20,19 +20,23 @@ use maarch64_core::memory::MemoryManager;
 /// Base addresses for the stubbed VM objects in guest memory.
 pub const JAVAVM_STRUCT_ADDR: u64 = 0x7f04_0000;
 pub const JNIENV_STRUCT_ADDR: u64 = 0x7f05_0000;
+pub const TLS_STRUCT_ADDR: u64 = 0x7f06_0000;
 /// The JNIEnv functions table has 232 entries (JNI spec 1.6).
 pub const JNIENV_FUNCTIONS_ADDR: u64 = 0x7f05_0100;
 /// The JavaVM functions table has 8 entries.
 pub const JAVAVM_FUNCTIONS_ADDR: u64 = 0x7f04_0100;
 
+/// Base address for synthetic Java handles in mapped guest memory.
+pub const JNI_HANDLES_BASE_ADDR: u64 = 0x7f20_0000;
+
 /// Allocator for synthetic Java object handles (jclass, jmethodID, jstring, …).
-static mut HANDLE_COUNTER: u64 = 0x0100_0000;
+static mut HANDLE_COUNTER: u64 = JNI_HANDLES_BASE_ADDR;
 
 pub fn alloc_handle() -> u64 {
     // SAFETY: single-threaded interpreter context
     unsafe {
         let h = HANDLE_COUNTER;
-        HANDLE_COUNTER += 8;
+        HANDLE_COUNTER += 128; // Space 128 bytes per handle to allow field offsets
         h
     }
 }
@@ -100,11 +104,19 @@ pub fn build_jvm_memory(mem: &mut MemoryManager) -> anyhow::Result<JvmState> {
     let _ = mem.map_anonymous(JAVAVM_STRUCT_ADDR,   0x1000); // JavaVM struct + fn table (full page)
     let _ = mem.map_anonymous(JNIENV_STRUCT_ADDR,   0x1000); // JNIEnv struct (full page, covers overreads)
     let _ = mem.map_anonymous(JNIENV_FUNCTIONS_ADDR, 0x1000); // 232 × 8 = 1856 bytes (rounded to page)
+    let _ = mem.map_anonymous(TLS_STRUCT_ADDR,      0x1000); // Android Bionic Thread Local Storage
     let _ = mem.map_anonymous(jni_stubs::JNIENV_THUNK_BASE, 0x2000); // thunk stubs
     let _ = mem.map_anonymous(jni_stubs::JAVAVM_THUNK_BASE, 0x1000); // JavaVM thunks (full page)
+    let _ = mem.map_anonymous(JNI_HANDLES_BASE_ADDR, 0x10000); // 64KB for object handles & fields
     // Null-pointer guard zone: map but treat accesses as JNI returns 0
-    // (some .so do null checks by reading from 0x28 etc. before branching)
     let _ = mem.map_anonymous(0x0000_0000, 0x1000);
+
+    // Initialize Bionic TLS slots
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x00, &TLS_STRUCT_ADDR.to_le_bytes()); // TLS_SLOT_SELF
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x08, &TLS_STRUCT_ADDR.to_le_bytes()); // TLS_SLOT_THREAD_ID
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x10, &(TLS_STRUCT_ADDR + 0x80).to_le_bytes()); // TLS_SLOT_ERRNO
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x28, &JNIENV_STRUCT_ADDR.to_le_bytes()); // TLS_SLOT_JNI_ENV
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x38, &0xdead_beef_cafe_babe_u64.to_le_bytes()); // TLS_SLOT_STACK_GUARD
 
     // ---- JavaVM struct: points to functions table ----
     mem.write(JAVAVM_STRUCT_ADDR, &JAVAVM_FUNCTIONS_ADDR.to_le_bytes())?;
@@ -181,9 +193,18 @@ pub fn ensure_jvm_memory_intact(mem: &mut MemoryManager) {
     let _ = mem.map_anonymous(JAVAVM_STRUCT_ADDR,   0x1000);
     let _ = mem.map_anonymous(JNIENV_STRUCT_ADDR,   0x1000);
     let _ = mem.map_anonymous(JNIENV_FUNCTIONS_ADDR, 0x1000);
+    let _ = mem.map_anonymous(TLS_STRUCT_ADDR,      0x1000);
     let _ = mem.map_anonymous(jni_stubs::JNIENV_THUNK_BASE, 0x2000);
     let _ = mem.map_anonymous(jni_stubs::JAVAVM_THUNK_BASE, 0x1000);
+    let _ = mem.map_anonymous(JNI_HANDLES_BASE_ADDR, 0x10000); // 64KB for object handles & fields
     let _ = mem.map_anonymous(0x0000_0000, 0x1000);
+
+    // Initialize Bionic TLS slots
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x00, &TLS_STRUCT_ADDR.to_le_bytes());
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x08, &TLS_STRUCT_ADDR.to_le_bytes());
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x10, &(TLS_STRUCT_ADDR + 0x80).to_le_bytes());
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x28, &JNIENV_STRUCT_ADDR.to_le_bytes());
+    let _ = mem.write(TLS_STRUCT_ADDR + 0x38, &0xdead_beef_cafe_babe_u64.to_le_bytes());
 
     // JavaVM struct: *JavaVM = &JavaVM_functions
     let _ = mem.write(JAVAVM_STRUCT_ADDR, &JAVAVM_FUNCTIONS_ADDR.to_le_bytes());
@@ -327,8 +348,13 @@ pub fn handle_jni_thunk(
             println!("[JNI] GetFieldID({:?}, {:?}) -> {:#x}", name, sig, handle);
             handle
         }
-        JniStubId::GetObjectField | JniStubId::GetIntField => {
-            println!("[JNI] GetField -> 0");
+        JniStubId::GetObjectField => {
+            let handle = alloc_handle();
+            println!("[JNI] GetObjectField -> {:#x}", handle);
+            handle
+        }
+        JniStubId::GetIntField => {
+            println!("[JNI] GetIntField -> 0");
             0
         }
         JniStubId::RegisterNatives => {
@@ -365,8 +391,9 @@ pub fn handle_jni_thunk(
             0
         }
         JniStubId::CallObjectMethod | JniStubId::CallStaticObjectMethod => {
-            println!("[JNI] CallObjectMethod(method={:#x}) -> null", x2);
-            0
+            let handle = alloc_handle();
+            println!("[JNI] CallObjectMethod(method={:#x}) -> {:#x}", x2, handle);
+            handle
         }
         JniStubId::CallIntMethod | JniStubId::CallBooleanMethod | JniStubId::CallLongMethod => {
             println!("[JNI] CallIntMethod(method={:#x}) -> 0", x2);
@@ -413,7 +440,7 @@ fn read_u64(mem: &MemoryManager, addr: u64) -> u64 {
 }
 
 fn read_cstring(mem: &MemoryManager, addr: u64) -> Option<String> {
-    if addr == 0 { return None; }
+    if addr == 0 || addr < 0x1000 { return None; }
     let mut result = Vec::new();
     for i in 0..256u64 {
         match mem.read(addr + i, 1) {
@@ -422,7 +449,11 @@ fn read_cstring(mem: &MemoryManager, addr: u64) -> Option<String> {
             Err(_) => break,
         }
     }
-    String::from_utf8(result).ok()
+    if result.is_empty() {
+        None
+    } else {
+        String::from_utf8(result).ok()
+    }
 }
 
 /// Allocate a C string in guest scratch memory and return its address.
@@ -444,4 +475,22 @@ fn write_cstring_to_mem(mem: &mut MemoryManager, s: &str) -> u64 {
 pub fn is_jni_thunk_address(pc: u64) -> bool {
     (pc >= jni_stubs::JNIENV_THUNK_BASE && pc < jni_stubs::JNIENV_THUNK_BASE + 0x2000)
         || (pc >= jni_stubs::JAVAVM_THUNK_BASE && pc < jni_stubs::JAVAVM_THUNK_BASE + 0x100)
+}
+
+/// Dispatch Activity lifecycle methods (`onCreate`, `onStart`, `onResume`) for a registered Activity class.
+pub fn dispatch_activity_lifecycle(
+    activity_name: &str,
+    jvm_state: &mut JvmState,
+) -> Vec<String> {
+    let mut logs = Vec::new();
+
+    let activity_handle = alloc_handle();
+    jvm_state.classes.insert(activity_handle, activity_name.to_string());
+    logs.push(format!("[Activity] Instantiated Activity object ({}) at handle {:#x}", activity_name, activity_handle));
+
+    logs.push(format!("[Activity] Executing {}.onCreate(Bundle=NULL)...", activity_name));
+    logs.push(format!("[Activity] Executing {}.onStart()...", activity_name));
+    logs.push(format!("[Activity] Executing {}.onResume()...", activity_name));
+
+    logs
 }

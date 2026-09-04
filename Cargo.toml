@@ -5,6 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "maarch64"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "maarch64-android"
+path = "src/main.rs"
+
 [dependencies]
 maarch64-core = { path = "../core" }
 maarch64-thunks = { path = "../thunks" }
